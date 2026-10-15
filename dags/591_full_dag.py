@@ -27,8 +27,9 @@ cohort = '19'
 
 headers = {
     "X-API-KEY": api_token,
-    "X-Nickname": nickname,
-    "X-Cohort": cohort
+    "X-Nickname": nickname, 
+    "X-Cohort": cohort,
+    "X-Project": "True"
 }
 
 
@@ -50,15 +51,24 @@ conn.close()
 # ============================================================
 
 def create_files_request(ti, api_endpoint, headers):
-
     method_url = '/generate_report'
 
     r = requests.post(
         'https://' + api_endpoint + method_url,
-        headers=headers
+        headers=headers,
+        timeout=30
     )
 
-    response_dict = json.loads(r.content)
+    print('HTTP status:', r.status_code)
+    print('Response:', repr(r.text[:2000]))
+
+    r.raise_for_status()
+    response_dict = r.json()
+
+    if 'task_id' not in response_dict:
+        raise ValueError(
+            f"В ответе API нет task_id: {response_dict}"
+        )
 
     ti.xcom_push(
         key='task_id',
@@ -66,7 +76,6 @@ def create_files_request(ti, api_endpoint, headers):
     )
 
     print('task_id:', response_dict['task_id'])
-
     return response_dict['task_id']
 
 
@@ -101,13 +110,21 @@ def check_report(ti, api_endpoint, headers):
             headers=headers
         )
 
-        response_dict = json.loads(r.content)
+        print('HTTP status:', r.status_code)
+        print('Response:', repr(r.text[:2000]))
 
-        print(i, response_dict['status'])
+        response_dict = r.json()
 
-        if response_dict['status'] == 'SUCCESS':
+        print(i, response_dict.get('status', response_dict))
+
+        if response_dict.get('status') == 'SUCCESS':
             report_id = response_dict['data']['report_id']
             break
+
+        if response_dict.get('status') not in ('PROCESSING', 'PENDING'):
+            raise Exception(
+                f"Unexpected API response: {response_dict}"
+            )
 
     if report_id is None:
         raise Exception('Report was not generated')
@@ -155,7 +172,7 @@ def upload_from_s3_to_pg(ti, nickname, cohort):
     psql_conn = BaseHook.get_connection('pg_connection')
 
     conn = psycopg2.connect(
-        f"dbname='student' "
+        f"dbname='de' "
         f"port='{psql_conn.port}' "
         f"user='{psql_conn.login}' "
         f"host='{psql_conn.host}' "
@@ -173,11 +190,21 @@ def upload_from_s3_to_pg(ti, nickname, cohort):
 
             ALTER TABLE stage.user_order_log
                 ADD COLUMN IF NOT EXISTS uniq_id TEXT;
+
+            ALTER TABLE stage.user_order_log
+                ADD COLUMN IF NOT EXISTS status VARCHAR(20);
         """)
 
         # ====================================================
         # CUSTOMER RESEARCH
         # ====================================================
+
+        print(
+            personal_storage_url.replace(
+                '{FILE_NAME}',
+                'customer_research.csv'
+            )
+        )
 
         df_customer_research = pd.read_csv(
             personal_storage_url.replace(
@@ -413,7 +440,7 @@ def update_mart_d_tables(ti):
     )
 
     conn = psycopg2.connect(
-        f"dbname='student' "
+        f"dbname='de' "
         f"port='{psql_conn.port}' "
         f"user='{psql_conn.login}' "
         f"host='{psql_conn.host}' "
@@ -540,7 +567,7 @@ def update_mart_f_tables(ti):
     psql_conn = BaseHook.get_connection('pg_connection')
 
     conn = psycopg2.connect(
-        f"dbname='student' "
+        f"dbname='de' "
         f"port='{psql_conn.port}' "
         f"user='{psql_conn.login}' "
         f"host='{psql_conn.host}' "
@@ -552,6 +579,8 @@ def update_mart_f_tables(ti):
     try:
         # F_ACTIVITY
         cur.execute("""
+            TRUNCATE TABLE mart.f_activity;
+
             INSERT INTO mart.f_activity
             (
                 activity_id,
@@ -570,155 +599,51 @@ def update_mart_f_tables(ti):
                 dc.date_id;
         """)
 
-        # F_SALES
+        # F_DAILY_SALES
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS mart.f_sales
-            (
-                transaction_id BIGSERIAL PRIMARY KEY,
-                date_id INTEGER NOT NULL,
-                item_id INTEGER NOT NULL,
-                customer_id INTEGER NOT NULL,
-                price NUMERIC(14, 2),
-                quantity BIGINT NOT NULL,
-                payment_amount NUMERIC(14, 2) NOT NULL,
-                status VARCHAR(20) NOT NULL,
+            TRUNCATE TABLE mart.f_daily_sales;
 
-                FOREIGN KEY (date_id)
-                    REFERENCES mart.d_calendar(date_id),
-
-                FOREIGN KEY (item_id)
-                    REFERENCES mart.d_item(item_id),
-
-                FOREIGN KEY (customer_id)
-                    REFERENCES mart.d_customer(customer_id)
-            );
-        """)
-
-        cur.execute("TRUNCATE TABLE mart.f_sales RESTART IDENTITY;")
-
-        cur.execute("""
-            INSERT INTO mart.f_sales
+            INSERT INTO mart.f_daily_sales
             (
                 date_id,
                 item_id,
                 customer_id,
                 price,
                 quantity,
-                payment_amount,
-                status
+                payment_amount
             )
             SELECT
                 dc.date_id,
                 uol.item_id,
                 uol.customer_id::INTEGER,
                 ROUND(
-                    ABS(uol.payment_amount)
-                    / NULLIF(ABS(uol.quantity), 0),
+                    SUM(ABS(uol.payment_amount))
+                    / NULLIF(SUM(ABS(uol.quantity)), 0),
                     2
                 ),
-                CASE
-                    WHEN LOWER(COALESCE(uol.status, 'shipped')) = 'refunded'
-                        THEN -ABS(uol.quantity)
-                    ELSE ABS(uol.quantity)
-                END,
-                CASE
-                    WHEN LOWER(COALESCE(uol.status, 'shipped')) = 'refunded'
-                        THEN -ABS(uol.payment_amount)
-                    ELSE ABS(uol.payment_amount)
-                END,
-                LOWER(COALESCE(uol.status, 'shipped'))
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(uol.status, 'shipped')) = 'refunded'
+                            THEN -ABS(uol.quantity)
+                        ELSE ABS(uol.quantity)
+                    END
+                ),
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(uol.status, 'shipped')) = 'refunded'
+                            THEN -ABS(uol.payment_amount)
+                        ELSE ABS(uol.payment_amount)
+                    END
+                )
             FROM stage.user_order_log AS uol
             JOIN mart.d_calendar AS dc
                 ON dc.fact_date = uol.date_time::date
             WHERE uol.item_id IS NOT NULL
-              AND uol.customer_id IS NOT NULL;
-        """)
-
-        # F_CUSTOMER_RETENTION
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS mart.f_customer_retention
-            (
-                new_customers_count INTEGER NOT NULL,
-                returning_customers_count INTEGER NOT NULL,
-                refunded_customer_count INTEGER NOT NULL,
-                period_name VARCHAR(20) NOT NULL,
-                period_id INTEGER NOT NULL,
-                item_id INTEGER NOT NULL,
-                new_customers_revenue NUMERIC(15, 2) NOT NULL,
-                returning_customers_revenue NUMERIC(15, 2) NOT NULL,
-                customers_refunded INTEGER NOT NULL,
-                PRIMARY KEY (period_id, item_id)
-            );
-        """)
-
-        cur.execute("DELETE FROM mart.f_customer_retention;")
-
-        cur.execute("""
-            WITH customer_week AS (
-                SELECT
-                    DATE_TRUNC('week', dc.fact_date)::date AS week_start,
-                    fs.customer_id,
-                    COUNT(*) AS orders_count
-                FROM mart.f_sales AS fs
-                JOIN mart.d_calendar AS dc
-                    ON dc.date_id = fs.date_id
-                WHERE fs.status <> 'refunded'
-                GROUP BY
-                    DATE_TRUNC('week', dc.fact_date)::date,
-                    fs.customer_id
-            ),
-            sales_with_customer_type AS (
-                SELECT
-                    DATE_TRUNC('week', dc.fact_date)::date AS week_start,
-                    fs.item_id,
-                    fs.customer_id,
-                    fs.status,
-                    fs.payment_amount,
-                    COALESCE(cw.orders_count, 0) AS orders_count
-                FROM mart.f_sales AS fs
-                JOIN mart.d_calendar AS dc
-                    ON dc.date_id = fs.date_id
-                LEFT JOIN customer_week AS cw
-                    ON cw.week_start =
-                       DATE_TRUNC('week', dc.fact_date)::date
-                   AND cw.customer_id = fs.customer_id
-            )
-            INSERT INTO mart.f_customer_retention
-            (
-                new_customers_count,
-                returning_customers_count,
-                refunded_customer_count,
-                period_name,
-                period_id,
-                item_id,
-                new_customers_revenue,
-                returning_customers_revenue,
-                customers_refunded
-            )
-            SELECT
-                COUNT(DISTINCT customer_id)
-                    FILTER (WHERE orders_count = 1),
-                COUNT(DISTINCT customer_id)
-                    FILTER (WHERE orders_count > 1),
-                COUNT(DISTINCT customer_id)
-                    FILTER (WHERE status = 'refunded'),
-                'weekly',
-                TO_CHAR(week_start, 'IYYYIW')::INTEGER,
-                item_id,
-                COALESCE(
-                    SUM(payment_amount)
-                        FILTER (WHERE orders_count = 1),
-                    0
-                ),
-                COALESCE(
-                    SUM(payment_amount)
-                        FILTER (WHERE orders_count > 1),
-                    0
-                ),
-                COUNT(*)
-                    FILTER (WHERE status = 'refunded')
-            FROM sales_with_customer_type
-            GROUP BY week_start, item_id;
+              AND uol.customer_id IS NOT NULL
+            GROUP BY
+                dc.date_id,
+                uol.item_id,
+                uol.customer_id;
         """)
 
         conn.commit()
